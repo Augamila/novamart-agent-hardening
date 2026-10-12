@@ -1,0 +1,15 @@
+This repository contains material under two licenses.
+
+1. Udacity course scaffolding
+   config.py, infrastructure/, tests/, agentcore/, src/ modules other than
+   src/agent_orchestrator.py, diagrams/ and the policy documents in
+   infrastructure/seed_data.py are from Udacity's cd14764-aws-agentic-c3-classroom
+   repository, (c) Udacity, Inc., licensed under Creative Commons
+   Attribution-NonCommercial-NoDerivatives 4.0 International (CC BY-NC-ND 4.0):
+   http://creativecommons.org/licenses/by-nc-nd/4.0/
+   It is reproduced unmodified for non-commercial, educational purposes.
+
+2. Documentation by Augustine Milanzi
+   Everything under docs/ (excluding docs/evidence/, which records program
+   output) and README.md is licensed under Creative Commons Attribution 4.0
+   International (CC BY 4.0): https://creativecommons.org/licenses/by/4.0/

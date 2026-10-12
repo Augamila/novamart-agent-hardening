@@ -1,0 +1,407 @@
+diff --git a/src/agent_orchestrator.py b/src/agent_orchestrator.py
+index 566977c..d65a724 100644
+--- a/src/agent_orchestrator.py
++++ b/src/agent_orchestrator.py
+@@ -27,7 +27,7 @@ updates it after the worker responds.
+ Commands:
+   python src/agent_orchestrator.py test            # 3 scenarios, local run, traced to X-Ray
+   python src/agent_orchestrator.py chat            # interactive terminal chat
+-  python src/agent_orchestrator.py deploy          # Tasks 3-6 deployment pipeline (uses the AgentCore CLI)
++  python src/agent_orchestrator.py deploy          # full deployment pipeline (uses the AgentCore CLI)
+   python src/agent_orchestrator.py invoke "<msg>"  # call the deployed AgentCore Runtime
+   python src/agent_orchestrator.py serve           # HTTP server (what AgentCore Runtime runs)
+ 
+@@ -43,6 +43,7 @@ import os
+ import sys
+ import uuid
+ import logging
++import re
+ import threading
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from typing import Optional
+@@ -90,7 +91,7 @@ from agent_utils import (
+ # the worker-agent nodes on the X-Ray Service Map) and logged at INFO level.
+ # Use it exactly like `strands.tool`:  @tool  above each tool function.
+ from agent_observability import (
+-    tool, tracer, setup_logging, flush_logs, print_trace_hint,
++    tool, tracer, setup_logging, flush_logs,
+     apply_observability_config, wait_for_runtime_ready,
+ )
+ 
+@@ -209,7 +210,7 @@ def _update_workflow_state(session_id: str, updates: dict,
+ 
+ 
+ # ═══════════════════════════════════════════════════════
+-#  TASK 2 - MULTI-AGENT ORCHESTRATION
++#  MULTI-AGENT ORCHESTRATION
+ # ═══════════════════════════════════════════════════════
+ 
+ from datetime import date, datetime, timezone
+@@ -594,7 +595,26 @@ information. If nothing relevant was retrieved, reply exactly: NO RELEVANT {doma
+ 
+     @tool
+     def retrieve_returns_policy(query: str) -> str:
+-        """Retrieve relevant passages from the Returns Policy knowledge base."""
++        """
++        Search the Returns Policy knowledge base and return the top 3 passages.
++
++        Calls the Bedrock Knowledge Bases Retrieve API on config.RETURNS_KB_ID
++        (S3 Vectors index, Titan Text Embeddings V2). The KB indexes
++        policies/returns/: return_policy.txt plus customer_tiers.txt, so tier rules
++        are retrievable from every domain.
++
++        Covers: return windows by tier, the return process and prepaid label, refund timing, non-returnable and gift items, damaged or defective items.
++
++        Args:
++            query: A concise natural-language search query; the retriever
++                agent may rephrase the customer's question first.
++
++        Returns:
++            Up to three passages, highest relevance first, each tagged with its
++            score and source S3 URI, or "No relevant policy documents found."
++            An empty result is returned, not raised - the PolicyAgent decides
++            how to report a gap ("The policy documents do not specify this").
++        """
+         return format_kb_results(retrieve_from_knowledge_base(config.RETURNS_KB_ID, query))
+ 
+     returns_retriever = Agent(
+@@ -606,7 +626,26 @@ information. If nothing relevant was retrieved, reply exactly: NO RELEVANT {doma
+ 
+     @tool
+     def retrieve_shipping_policy(query: str) -> str:
+-        """Retrieve relevant passages from the Shipping Policy knowledge base."""
++        """
++        Search the Shipping Policy knowledge base and return the top 3 passages.
++
++        Calls the Bedrock Knowledge Bases Retrieve API on config.SHIPPING_KB_ID
++        (S3 Vectors index, Titan Text Embeddings V2). The KB indexes
++        policies/shipping/: shipping_policy.txt plus customer_tiers.txt, so tier rules
++        are retrievable from every domain.
++
++        Covers: domestic options, prices and delivery times, international shipping and duties, Premium free expedited shipping.
++
++        Args:
++            query: A concise natural-language search query; the retriever
++                agent may rephrase the customer's question first.
++
++        Returns:
++            Up to three passages, highest relevance first, each tagged with its
++            score and source S3 URI, or "No relevant policy documents found."
++            An empty result is returned, not raised - the PolicyAgent decides
++            how to report a gap ("The policy documents do not specify this").
++        """
+         return format_kb_results(retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query))
+ 
+     shipping_retriever = Agent(
+@@ -618,7 +657,26 @@ information. If nothing relevant was retrieved, reply exactly: NO RELEVANT {doma
+ 
+     @tool
+     def retrieve_warranty_policy(query: str) -> str:
+-        """Retrieve relevant passages from the Warranty Policy knowledge base."""
++        """
++        Search the Warranty Policy knowledge base and return the top 3 passages.
++
++        Calls the Bedrock Knowledge Bases Retrieve API on config.WARRANTY_KB_ID
++        (S3 Vectors index, Titan Text Embeddings V2). The KB indexes
++        policies/warranty/: warranty_policy.txt plus customer_tiers.txt, so tier rules
++        are retrievable from every domain.
++
++        Covers: standard and electronics warranty terms, coverage and exclusions, the claims process, extended protection plans, the Premium 3-year electronics warranty.
++
++        Args:
++            query: A concise natural-language search query; the retriever
++                agent may rephrase the customer's question first.
++
++        Returns:
++            Up to three passages, highest relevance first, each tagged with its
++            score and source S3 URI, or "No relevant policy documents found."
++            An empty result is returned, not raised - the PolicyAgent decides
++            how to report a gap ("The policy documents do not specify this").
++        """
+         return format_kb_results(retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query))
+ 
+     warranty_retriever = Agent(
+@@ -648,7 +706,7 @@ information. If nothing relevant was retrieved, reply exactly: NO RELEVANT {doma
+             'Warranty': warranty_retriever,
+         }
+ 
+-        # ── Trace: show parallel KB dispatch to learners ──────────────────
++        # ── Trace: show the parallel KB dispatch ──────────────────────────
+         trace.kb_start({
+             'Returns':  config.RETURNS_KB_ID,
+             'Shipping': config.SHIPPING_KB_ID,
+@@ -760,10 +818,16 @@ Content rules:
+   and how the customer can follow up.
+ - For a denied return, explain the reason (window or order status) kindly and offer an
+   alternative where the policy context supports one (e.g. warranty).
+-- For calculation questions (no agent findings), compute the answer yourself step by step
+-  with exact arithmetic, round currency to cents only at the very end (half up), and show
+-  the short working.
+-- Never mention internal agents, tools, workflow state, sessions or databases.
++- For calculation questions (the context holds no order, policy or refund details), compute
++  the answer yourself with exact arithmetic and show the short working with every
++  intermediate value unrounded (e.g. a discount of $14.995, not $14.99). Round currency to
++  cents only in the final total (half up).
++- Never state or imply the customer's tier (Standard or Premium) unless the InventoryAgent
++  findings include it. For general policy questions, describe the terms for each tier
++  without saying which one the customer is.
++- Never mention internal agents, tools, findings, workflow state, sessions, IDs or databases,
++  and never describe what kind of question this is or how the reply was produced. Start
++  directly with the answer.
+ 
+ Tone: warm, professional and concise. Address the customer by first name if known.
+ Output only the message text - no preamble, no sign-off placeholders like [Name]."""
+@@ -1011,7 +1075,7 @@ with nothing added, removed or summarized."""
+ 
+ def _apply_guardrail(agents: list) -> None:
+     """
+-    Attach the Bedrock Guardrail (Task 3) to every agent's BedrockModel.
++    Attach the Bedrock Guardrail to every agent's BedrockModel.
+     Guardrails are enforced per model invocation, so once GUARDRAIL_ID /
+     GUARDRAIL_VERSION are known (in .env locally, as runtime environment
+     variables when deployed) every agent in the graph runs behind the
+@@ -1080,9 +1144,19 @@ _SRC_DIR        = os.path.dirname(os.path.abspath(__file__))
+ 
+ 
+ # ═══════════════════════════════════════════════════════
+-#  TASK 3 - AGENTCORE DEPLOYMENT + GUARDRAILS
++#  AGENTCORE DEPLOYMENT + GUARDRAILS
+ # ═══════════════════════════════════════════════════════
+ 
++# Customer-facing text the guardrail returns when it intervenes. Kept as
++# constants so final_customer_reply() can recognise a guardrail response.
++GUARDRAIL_BLOCKED_INPUT_MESSAGE = (
++    "I'm sorry, I can't help with that request. I'm happy to help with your NovaMart "
++    "orders, returns, refunds, shipping or warranty questions.")
++GUARDRAIL_BLOCKED_OUTPUT_MESSAGE = (
++    "I'm sorry, I can't share that response. Please contact NovaMart customer support "
++    "if you need further help with your order.")
++
++
+ def create_guardrail() -> tuple[str, str]:
+     """
+     Create a Bedrock Guardrail for enterprise safety enforcement.
+@@ -1178,12 +1252,8 @@ def create_guardrail() -> tuple[str, str]:
+         },
+         crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+         wordPolicyConfig={'managedWordListsConfig': [{'type': 'PROFANITY'}]},
+-        blockedInputMessaging=(
+-            "I'm sorry, I can't help with that request. I'm happy to help with your NovaMart "
+-            "orders, returns, refunds, shipping or warranty questions."),
+-        blockedOutputsMessaging=(
+-            "I'm sorry, I can't share that response. Please contact NovaMart customer support "
+-            "if you need further help with your order."),
++        blockedInputMessaging=GUARDRAIL_BLOCKED_INPUT_MESSAGE,
++        blockedOutputsMessaging=GUARDRAIL_BLOCKED_OUTPUT_MESSAGE,
+         clientRequestToken=str(uuid.uuid4()),
+     )
+     guardrail_id = response['guardrailId']
+@@ -1268,7 +1338,7 @@ def deploy_to_agentcore_runtime(
+     missing = [k for k, v in runtime_env.items() if not v]
+     if missing:
+         raise ValueError(f"Cannot deploy - missing runtime settings: {missing}. "
+-                         f"Set the Knowledge Base IDs in .env (Task 5) first.")
++                         f"Set the Knowledge Base IDs in .env first.")
+     if not str(guardrail_version).isdigit():
+         raise ValueError(f"Guardrail version is {guardrail_version!r}; the runtime "
+                          f"must use a published numbered version, not DRAFT.")
+@@ -1283,7 +1353,13 @@ def deploy_to_agentcore_runtime(
+     runtime_arn = agentcore_cli.deployed_runtime_arn()
+ 
+     if not runtime_arn:
+-        raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
++        # `agentcore deploy` returned without error but the stack exposes no
++        # runtime ARN - usually a CDK rollback. Fail loudly instead of moving
++        # on to the memory and observability steps with no runtime.
++        raise RuntimeError(
++            f"AgentCore deploy finished but no runtime ARN was found in stack "
++            f"{agentcore_cli.stack_name()}. Check its CloudFormation events, then "
++            f"re-run: python src/agent_orchestrator.py deploy")
+ 
+     # Wait for the runtime to become READY and return its ARN.
+     print(f"  Runtime deployed: {runtime_arn}")
+@@ -1294,7 +1370,7 @@ def deploy_to_agentcore_runtime(
+ 
+ 
+ # ═══════════════════════════════════════════════════════
+-#  TASK 4 - MEMORY
++#  MEMORY
+ # ═══════════════════════════════════════════════════════
+ 
+ def configure_memory(runtime_arn: str) -> str:
+@@ -1327,8 +1403,8 @@ def configure_memory(runtime_arn: str) -> str:
+         clientToken=str(uuid.uuid4()),
+     )
+ 
+-    if response is None:
+-        raise NotImplementedError("configure_memory: create_memory() not implemented")
++    if 'memory' not in (response or {}):
++        raise RuntimeError(f"create_memory returned no memory resource: {response!r}")
+ 
+     # Wait until the memory resource is ACTIVE and return its ARN.
+     memory = response['memory']
+@@ -1346,7 +1422,7 @@ def configure_memory(runtime_arn: str) -> str:
+ 
+ 
+ # ═══════════════════════════════════════════════════════
+-#  TASK 6 - OBSERVABILITY
++#  OBSERVABILITY
+ # ═══════════════════════════════════════════════════════
+ 
+ def configure_observability(runtime_arn: str) -> None:
+@@ -1525,7 +1601,7 @@ def deploy_agentcore_gateway() -> dict:
+     Optional extension to the in-process @tool functions. Resolve configured
+     Lambda functions first; if none exist, skip gateway creation. Otherwise
+     create/reuse the gateway and submit its targets. Connecting agents to this
+-    MCP endpoint requires separate integration; this starter uses in-process tools.
++    MCP endpoint requires separate integration; this system uses in-process tools.
+ 
+     Requires Lambda tool functions to be deployed via a separate stack.
+     Set ORDERS_FUNCTION, POLICY_FUNCTION, CUSTOMERS_FUNCTION in .env.
+@@ -1642,7 +1718,7 @@ def invoke_agent(session_id: str, customer_id: str, user_message: str) -> dict:
+ # ═══════════════════════════════════════════════════════
+ 
+ def deploy_all():
+-    """Full deployment pipeline. Run after completing all tasks."""
++    """Full deployment pipeline: guardrail, AgentCore Runtime, memory, observability, optional gateway."""
+     print("\n" + "="*60)
+     print("  Deploying Enterprise Multi-Agent System")
+     print("="*60 + "\n")
+@@ -1704,6 +1780,81 @@ def deploy_all():
+     return runtime_arn, guardrail_id
+ 
+ 
++# ═══════════════════════════════════════════════════════
++#  FINAL REPLY - deterministic output control
++# ═══════════════════════════════════════════════════════
++
++FALLBACK_REPLY = (
++    "I'm sorry, I wasn't able to complete that request. I can help with your NovaMart "
++    "orders, returns, refunds, shipping or warranty questions - could you tell me a "
++    "little more about what you need?")
++
++# Phrases that only appear when internal pipeline text leaks into a reply.
++_INTERNAL_MARKERS = re.compile(
++    r"agent findings|\bsession id\b|\bcustomer id\b|route_to_\w+|initialize_session|"
++    r"workflow ?state|workflow context|routing rules|specialist agent|prompt injection|"
++    r"\b(?:orchestrator|inventory|policy|refund|communication)agent\b",
++    re.IGNORECASE)
++_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
++
++
++def _remove_internal_sentences(text: str) -> tuple[str, int]:
++    """Drop every sentence that contains an internal marker. Returns (text, removed)."""
++    removed, kept_lines = 0, []
++    for line in text.splitlines():
++        sentences = _SENTENCE_END.split(line)
++        kept = [x for x in sentences if not _INTERNAL_MARKERS.search(x)]
++        removed += len(sentences) - len(kept)
++        if kept or not line.strip():
++            kept_lines.append(" ".join(kept))
++    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines)).strip(), removed
++
++
++def final_customer_reply(response, state: dict | None) -> tuple[str, str]:
++    """
++    Decide what the customer sees, in code rather than by prompt.
++
++    The orchestrator is instructed never to answer the customer itself, but an
++    instruction is not a control: in testing it answered a prompt-injection
++    attempt directly, mentioning its routing rules and the session ID. So:
++
++      1. CommunicationAgent output in WorkflowState is the only normal source
++         of a reply.
++      2. If the guardrail intervened, its configured message passes through
++         unchanged (the orchestrator's first model call was blocked, so no
++         worker ran).
++      3. Anything else - the orchestrator speaking for itself - is replaced
++         by a fixed, safe clarification message.
++
++    Every reply then passes a deterministic check for internal markers;
++    offending sentences are removed, and if nothing is left the fallback is
++    used. Returns (text, source) where source is one of 'communication_agent',
++    'guardrail', 'fallback'; anything other than 'communication_agent' is
++    logged as a warning so it can be counted in CloudWatch.
++    """
++    state = state or {}
++    raw = str(response).strip()
++    comm = _strip_xml_tags(state.get('communication_agent', '') or '').strip()
++
++    if comm:
++        text, source = comm, 'communication_agent'
++    elif (getattr(response, 'stop_reason', None) == 'guardrail_intervened'
++          or raw in (GUARDRAIL_BLOCKED_INPUT_MESSAGE, GUARDRAIL_BLOCKED_OUTPUT_MESSAGE)):
++        return raw, 'guardrail'
++    else:
++        logger.warning("Orchestrator produced a reply without the CommunicationAgent "
++                       "(session %s); returning the fallback message", state.get('session_id'))
++        return FALLBACK_REPLY, 'fallback'
++
++    cleaned, removed = _remove_internal_sentences(text)
++    if removed:
++        logger.warning("Removed %d sentence(s) containing internal markers from the reply "
++                       "(session %s)", removed, state.get('session_id'))
++    if not cleaned:
++        return FALLBACK_REPLY, 'fallback'
++    return cleaned, source
++
++
+ # ═══════════════════════════════════════════════════════
+ #  LOCAL TEST SCENARIOS
+ # ═══════════════════════════════════════════════════════
+@@ -1738,8 +1889,10 @@ def run_test_scenarios() -> None:
+         prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
+         with tracer.trace_request(session_id, customer_id, query):
+             response = orchestrator(prompt)
+-        print(f"Response: {response}")
+-        print_trace_hint()
++        text, source = final_customer_reply(response, _read_workflow_state(session_id))
++        print(f"Response [{source}]: {text}")
++        if tracer.last_trace_id:
++            print(f"X-Ray trace: {tracer.last_trace_id}")
+     flush_logs()
+ 
+ 
+@@ -1819,8 +1972,7 @@ def run_chat() -> None:
+ 
+         # ── Resolve the final customer-facing text ────────────────────
+         final_state = _read_workflow_state(session_id) or {}
+-        comm_result = final_state.get('communication_agent', '')
+-        text = _strip_xml_tags(comm_result or str(response))
++        text, _source = final_customer_reply(response, final_state)
+ 
+         # ── DynamoDB workflow state summary ───────────────────────────
+         trace.summary(session_id, elapsed)
+@@ -1847,7 +1999,7 @@ def run_invoke(message: str, customer_id: str = "CUST-001") -> None:
+     print(f"Session: {session_id} | Customer: {customer_id}")
+     print(f"Query: {message}\n")
+     result = invoke_agent(session_id, customer_id, message)
+-    print(f"Response: {result.get('result', result)}")
++    print(f"Response [{result.get('reply_source', '?')}]: {result.get('result', result)}")
+     if result.get('trace_id'):
+         print(f"X-Ray trace: {result['trace_id']}")
+ 
+@@ -1900,11 +2052,10 @@ def run_serve() -> None:
+         with tracer.trace_request(session_id, customer_id, prompt):
+             response = _orchestrator()(enriched)
+ 
+-        state = _read_workflow_state(session_id) or {}
+-        text  = _strip_xml_tags(state.get('communication_agent', '') or str(response))
++        text, source = final_customer_reply(response, _read_workflow_state(session_id))
+         flush_logs()
+-        return {'result': text, 'session_id': session_id, 'customer_id': customer_id,
+-                'trace_id': tracer.last_trace_id}
++        return {'result': text, 'reply_source': source, 'session_id': session_id,
++                'customer_id': customer_id, 'trace_id': tracer.last_trace_id}
+ 
+     app.run()
+ 
+@@ -1937,7 +2088,7 @@ if __name__ == '__main__':
+ 
+     else:
+         print("Usage:")
+-        print("  python src/agent_orchestrator.py deploy           # Deploy to AgentCore (Tasks 3-6)")
++        print("  python src/agent_orchestrator.py deploy           # Deploy to AgentCore Runtime")
+         print("  python src/agent_orchestrator.py test             # Run the 3 test scenarios locally")
+         print("  python src/agent_orchestrator.py chat             # Interactive terminal chat")
+         print("  python src/agent_orchestrator.py invoke \"<msg>\"   # Call the deployed runtime")
